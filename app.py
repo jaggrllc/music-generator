@@ -1,39 +1,55 @@
 import streamlit as st
 import numpy as np
 from scipy.io import wavfile
-from pydub import AudioSegment, effects
-from pydub.effects import normalize as pydub_normalize
 import io
 import os
-from openai import OpenAI
-from serpapi import GoogleSearch
 import warnings
 warnings.filterwarnings("ignore")
 
+# Graceful pydub import with audioop-lts support
+try:
+    from pydub import AudioSegment, effects
+    from pydub.effects import normalize as pydub_normalize
+    PYDUB_AVAILABLE = True
+except Exception as e:
+    st.error(f"pydub failed to load: {e}. WAV export still works. Install audioop-lts or use Python 3.12.")
+    PYDUB_AVAILABLE = False
+
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+
+try:
+    from serpapi import GoogleSearch
+    SERP_AVAILABLE = True
+except ImportError:
+    SERP_AVAILABLE = False
+
 SAMPLE_RATE = 44100
-MAX_DURATION_MIN = 60  # safety limit
+MAX_DURATION_MIN = 45  # safer limit for cloud
 
 st.set_page_config(page_title="Original Sleep Music Generator", layout="wide")
-st.title("Copyright-Free Sleep / Ambient Music Generator")
-st.caption("Local synthesis (432 Hz, 528 Hz, binaural, etc.) + optional OpenAI/SerpAPI helpers. Perfect for YouTube deep-sleep tracks.")
+st.title("Copyright-Free Sleep & Ambient Music Generator")
+st.caption("Fully local synthesis • 432 Hz • 528 Hz • Binaural Beats • Export WAV / MP3")
 
-# ---------- Sidebar: API keys (secure) ----------
+# ---------- Sidebar ----------
 with st.sidebar:
-    st.header("API Keys (optional)")
-    st.caption("Used only for titles/descriptions or research. Leave blank for pure local generation.")
-    openai_key = st.text_input("OpenAI API Key", type="password", value=st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else "")
-    serp_key = st.text_input("SerpAPI Key", type="password", value=st.secrets.get("SERPAPI_API_KEY", "") if hasattr(st, "secrets") else "")
+    st.header("Optional API Keys")
+    openai_key = st.text_input("OpenAI API Key", type="password", key="openai_key")
+    serp_key = st.text_input("SerpAPI Key", type="password", key="serp_key")
     st.divider()
-    st.info("All music is generated locally from math. No samples, no copyrighted material.")
+    st.info("All audio is generated locally from pure math. No samples are used.")
 
 # ---------- Controls ----------
 col1, col2 = st.columns(2)
 with col1:
-    duration_min = st.slider("Duration (minutes)", 1, MAX_DURATION_MIN, 10)
-    base_freq = st.selectbox("Base / Carrier Frequency", [432, 528, 440, 200, "Custom"])
+    duration_min = st.slider("Duration (minutes)", 1, MAX_DURATION_MIN, 8)
+    base_freq = st.selectbox("Base Frequency", [432, 528, 440, 220, "Custom"])
     if base_freq == "Custom":
-        base_freq = st.number_input("Custom base Hz", 50.0, 1000.0, 432.0)
-    beat_freq = st.slider("Binaural Beat Frequency (Hz) – Delta 1-4 for deep sleep", 0.5, 10.0, 2.0, 0.1)
+        base_freq = st.number_input("Custom Hz", 40.0, 1200.0, 432.0, step=1.0)
+    beat_freq = st.slider("Binaural Beat (Hz)", 0.5, 8.0, 2.0, 0.1)
 
 with col2:
     genre = st.selectbox(
@@ -41,190 +57,160 @@ with col2:
         [
             "Deep Sleep 432Hz Binaural Delta",
             "528Hz Healing Meditation",
-            "Lo-fi Hip Hop Ambient",
-            "Cello & Piano Soft",
+            "Soft Pink Noise + Binaural",
+            "Lo-fi Ambient",
+            "Cello & Piano Soft Pads",
             "Classical Ambient",
-            "Pink Noise + Binaural",
-            "Custom (describe below)"
+            "Warm Drone + Heartbeat",
         ]
     )
-    custom_genre = st.text_area("Custom genre description (optional, uses OpenAI if key provided)", height=80)
 
-# Advanced audio processing
 st.subheader("Audio Processing")
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 with c1:
     do_normalize = st.checkbox("Normalize", value=True)
-    fade_sec = st.slider("Fade in/out (seconds)", 0, 30, 5)
 with c2:
-    bass_boost_db = st.slider("Bass boost / cut (dB)", -12, 12, 0)
+    fade_sec = st.slider("Fade in/out (sec)", 0, 20, 4)
 with c3:
-    high_shelf_db = st.slider("High shelf / air (dB)", -6, 6, 0)
+    bass_boost_db = st.slider("Bass boost (dB)", -10, 10, 0)
+with c4:
+    high_shelf_db = st.slider("High shelf (dB)", -6, 6, 0)
 
-generate_btn = st.button("Generate Music", type="primary")
-
-# ---------- Helper synthesis functions ----------
-def generate_noise(duration_sec, noise_type="pink", amplitude=0.3):
-    n = int(duration_sec * SAMPLE_RATE)
-    white = np.random.randn(n).astype(np.float32)
-    if noise_type == "white":
-        noise = white
-    elif noise_type == "pink":
-        # simple 1/f approximation via cumulative
-        noise = np.cumsum(white)
-    elif noise_type == "brown":
-        noise = np.cumsum(np.cumsum(white))
-    else:
-        noise = white
-    noise = noise / (np.max(np.abs(noise)) + 1e-8) * amplitude
-    return noise
-
-def generate_binaural(duration_sec, carrier, beat, amplitude=0.25):
-    n = int(duration_sec * SAMPLE_RATE)
-    t = np.linspace(0, duration_sec, n, endpoint=False, dtype=np.float32)
-    left = np.sin(2 * np.pi * carrier * t) * amplitude
-    right = np.sin(2 * np.pi * (carrier + beat) * t) * amplitude
-    return np.column_stack([left, right])
-
-def generate_pad(duration_sec, freq, harmonics=5, amplitude=0.2):
-    n = int(duration_sec * SAMPLE_RATE)
-    t = np.linspace(0, duration_sec, n, endpoint=False, dtype=np.float32)
-    wave = np.zeros_like(t)
-    for h in range(1, harmonics + 1):
-        wave += np.sin(2 * np.pi * freq * h * t) / h
-    # slow amplitude modulation
-    lfo = 0.5 + 0.5 * np.sin(2 * np.pi * 0.05 * t)
-    wave = wave * lfo * amplitude / harmonics
-    return np.column_stack([wave, wave])  # stereo
-
-def simple_lofi_beat(duration_sec, bpm=60):
-    n = int(duration_sec * SAMPLE_RATE)
-    audio = np.zeros(n, dtype=np.float32)
-    beat_interval = int(60 / bpm * SAMPLE_RATE)
-    for i in range(0, n, beat_interval):
-        # soft kick (low sine burst)
-        kick_len = min(8000, n - i)
-        t = np.linspace(0, kick_len / SAMPLE_RATE, kick_len)
-        kick = np.sin(2 * np.pi * 60 * t) * np.exp(-t * 8) * 0.4
-        audio[i:i+kick_len] += kick
-    # light vinyl crackle
-    crackle = generate_noise(duration_sec, "white", 0.02)
-    audio += crackle
-    return np.column_stack([audio, audio])
-
-# ---------- Main generation ----------
-if generate_btn:
+if st.button("Generate Music", type="primary"):
     duration_sec = duration_min * 60
-    if duration_sec > MAX_DURATION_MIN * 60:
-        st.error("Duration too long for safety.")
-        st.stop()
+    base = float(base_freq)
 
-    with st.spinner("Synthesizing original music..."):
-        # Base layers according to genre
-        if "Deep Sleep" in genre or "Binaural" in genre or "Pink Noise" in genre:
-            binaural = generate_binaural(duration_sec, float(base_freq), beat_freq, 0.18)
-            noise = generate_noise(duration_sec, "pink", 0.25)
-            noise_stereo = np.column_stack([noise, noise])
-            pad = generate_pad(duration_sec, float(base_freq) / 2, 4, 0.15)
-            mix = binaural + noise_stereo * 0.6 + pad
-        elif "528Hz" in genre or "Healing" in genre or "Meditation" in genre:
-            binaural = generate_binaural(duration_sec, 528 if base_freq == 528 else float(base_freq), beat_freq * 0.5, 0.15)
-            pad = generate_pad(duration_sec, 264, 6, 0.22)
-            noise = generate_noise(duration_sec, "pink", 0.12)
-            noise_stereo = np.column_stack([noise, noise])
-            mix = binaural * 0.7 + pad + noise_stereo
+    with st.spinner("Generating original music…"):
+        def noise(duration, kind="pink", amp=0.25):
+            n = int(duration * SAMPLE_RATE)
+            white = np.random.randn(n).astype(np.float32)
+            if kind == "pink":
+                sig = np.cumsum(white)
+            elif kind == "brown":
+                sig = np.cumsum(np.cumsum(white))
+            else:
+                sig = white
+            return sig / (np.max(np.abs(sig)) + 1e-8) * amp
+
+        def binaural(duration, carrier, beat, amp=0.2):
+            n = int(duration * SAMPLE_RATE)
+            t = np.linspace(0, duration, n, endpoint=False)
+            left = np.sin(2 * np.pi * carrier * t) * amp
+            right = np.sin(2 * np.pi * (carrier + beat) * t) * amp
+            return np.column_stack([left, right])
+
+        def pad(duration, freq, harmonics=5, amp=0.18):
+            n = int(duration * SAMPLE_RATE)
+            t = np.linspace(0, duration, n, endpoint=False)
+            wave = np.zeros_like(t)
+            for h in range(1, harmonics + 1):
+                wave += np.sin(2 * np.pi * freq * h * t) / (h ** 1.2)
+            lfo = 0.65 + 0.35 * np.sin(2 * np.pi * 0.04 * t)
+            wave *= lfo * amp / harmonics
+            return np.column_stack([wave, wave])
+
+        # Layer selection by genre
+        if "Deep Sleep" in genre or "Pink Noise" in genre:
+            mix = binaural(duration_sec, base, beat_freq, 0.16)
+            mix += np.column_stack([noise(duration_sec, "pink", 0.22)] * 2)
+            mix += pad(duration_sec, base * 0.5, 4, 0.12)
+        elif "528" in genre or "Healing" in genre or "Meditation" in genre:
+            mix = binaural(duration_sec, 528 if base == 528 else base, beat_freq * 0.6, 0.14)
+            mix += pad(duration_sec, base * 0.5, 6, 0.2)
+            mix += np.column_stack([noise(duration_sec, "pink", 0.1)] * 2)
         elif "Lo-fi" in genre:
-            beat = simple_lofi_beat(duration_sec, 55)
-            pad = generate_pad(duration_sec, float(base_freq) / 4, 3, 0.18)
-            mix = beat * 0.5 + pad
+            mix = pad(duration_sec, base * 0.4, 4, 0.2)
+            mix += np.column_stack([noise(duration_sec, "brown", 0.08)] * 2)
         elif "Cello" in genre or "Piano" in genre:
-            # layered soft tones with slow decay feel
-            pad1 = generate_pad(duration_sec, float(base_freq) / 2, 8, 0.2)
-            pad2 = generate_pad(duration_sec, float(base_freq) * 0.75, 5, 0.12)
-            mix = pad1 + pad2
+            mix = pad(duration_sec, base * 0.5, 8, 0.2)
+            mix += pad(duration_sec, base * 0.75, 5, 0.12)
         elif "Classical" in genre:
-            pad = generate_pad(duration_sec, float(base_freq) / 2, 7, 0.2)
-            higher = generate_pad(duration_sec, float(base_freq), 4, 0.1)
-            mix = pad + higher * 0.6
-        else:
-            # fallback / custom
-            mix = generate_binaural(duration_sec, float(base_freq), beat_freq) + generate_pad(duration_sec, float(base_freq)/2)
+            mix = pad(duration_sec, base * 0.5, 7, 0.18)
+            mix += pad(duration_sec, base, 4, 0.1)
+        else:  # Warm Drone
+            mix = pad(duration_sec, base * 0.5, 6, 0.22)
+            mix += binaural(duration_sec, base, 1.5, 0.1)
 
-        # Normalize mix amplitude
-        max_amp = np.max(np.abs(mix))
-        if max_amp > 0:
-            mix = mix / max_amp * 0.85
+        # Normalize peak
+        peak = np.max(np.abs(mix))
+        if peak > 0:
+            mix = mix / peak * 0.82
 
-        # Convert to AudioSegment via temporary WAV in memory
-        # Interleave for pydub (int16)
-        mix_int = (mix * 32767).astype(np.int16)
-        # Write to BytesIO as WAV
+        # Convert to int16 WAV in memory
+        mix_int = (np.clip(mix, -1, 1) * 32767).astype(np.int16)
         wav_io = io.BytesIO()
         wavfile.write(wav_io, SAMPLE_RATE, mix_int)
-        wav_io.seek(0)
-        audio = AudioSegment.from_wav(wav_io)
+        wav_bytes = wav_io.getvalue()
 
-        # Processing
-        if fade_sec > 0:
-            audio = audio.fade_in(fade_sec * 1000).fade_out(fade_sec * 1000)
-        if bass_boost_db != 0:
-            # simple low-shelf approximation via low-pass overlay
-            low = audio.low_pass_filter(120)
-            audio = audio.overlay(low + bass_boost_db)
-        if high_shelf_db != 0:
-            high = audio.high_pass_filter(8000)
-            audio = audio.overlay(high + high_shelf_db)
-        if do_normalize:
-            audio = pydub_normalize(audio, headroom=0.5)
+        # Optional pydub processing + MP3
+        mp3_bytes = None
+        if PYDUB_AVAILABLE:
+            try:
+                wav_io.seek(0)
+                audio = AudioSegment.from_wav(wav_io)
+                if fade_sec > 0:
+                    audio = audio.fade_in(fade_sec * 1000).fade_out(fade_sec * 1000)
+                if bass_boost_db != 0:
+                    low = audio.low_pass_filter(100)
+                    audio = audio.overlay(low + bass_boost_db)
+                if high_shelf_db != 0:
+                    high = audio.high_pass_filter(6000)
+                    audio = audio.overlay(high + high_shelf_db)
+                if do_normalize:
+                    audio = pydub_normalize(audio, headroom=1.0)
 
-        # Export options
-        wav_out = io.BytesIO()
-        audio.export(wav_out, format="wav")
-        wav_bytes = wav_out.getvalue()
+                # Re-export processed WAV
+                out_wav = io.BytesIO()
+                audio.export(out_wav, format="wav")
+                wav_bytes = out_wav.getvalue()
 
-        mp3_out = io.BytesIO()
-        audio.export(mp3_out, format="mp3", bitrate="192k")
-        mp3_bytes = mp3_out.getvalue()
+                # MP3
+                out_mp3 = io.BytesIO()
+                audio.export(out_mp3, format="mp3", bitrate="192k")
+                mp3_bytes = out_mp3.getvalue()
+            except Exception as e:
+                st.warning(f"Advanced processing skipped: {e}")
 
     st.success("Music generated!")
     st.audio(wav_bytes, format="audio/wav")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button("Download WAV", wav_bytes, file_name=f"sleep_{genre.replace(' ', '_')}_{duration_min}min.wav", mime="audio/wav")
-    with c2:
-        st.download_button("Download MP3", mp3_bytes, file_name=f"sleep_{genre.replace(' ', '_')}_{duration_min}min.mp3", mime="audio/mpeg")
+    col_dl1, col_dl2 = st.columns(2)
+    with col_dl1:
+        st.download_button(
+            "Download WAV",
+            wav_bytes,
+            file_name=f"sleep_{genre.replace(' ', '_')}_{duration_min}min.wav",
+            mime="audio/wav"
+        )
+    with col_dl2:
+        if mp3_bytes:
+            st.download_button(
+                "Download MP3",
+                mp3_bytes,
+                file_name=f"sleep_{genre.replace(' ', '_')}_{duration_min}min.mp3",
+                mime="audio/mpeg"
+            )
+        else:
+            st.info("MP3 export requires ffmpeg + working pydub")
 
-    # Optional OpenAI title / description
-    if openai_key:
+    # Optional OpenAI title/description
+    if openai_key and OPENAI_AVAILABLE:
         try:
             client = OpenAI(api_key=openai_key)
-            prompt = f"Create a YouTube-friendly title and short description for an original, copyright-free {genre} track of {duration_min} minutes using {base_freq}Hz carrier and {beat_freq}Hz binaural beat for deep sleep / relaxation. Keep it calm and professional."
+            prompt = (
+                f"Write a calm, professional YouTube title and short description "
+                f"for an original {duration_min}-minute {genre} track using {base} Hz "
+                f"and {beat_freq} Hz binaural beats. Keep it suitable for a sleep channel."
+            )
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=200
+                max_tokens=180
             )
-            st.subheader("Suggested Title & Description (OpenAI)")
+            st.subheader("Suggested Title & Description")
             st.write(resp.choices[0].message.content)
         except Exception as e:
-            st.warning(f"OpenAI call failed: {e}")
-
-    # Optional SerpAPI research
-    if serp_key and st.button("Research frequencies with SerpAPI"):
-        try:
-            search = GoogleSearch({
-                "q": f"best frequencies for {genre} binaural beats deep sleep",
-                "api_key": serp_key
-            })
-            results = search.get_dict()
-            st.subheader("Related search snippets")
-            for res in results.get("organic_results", [])[:5]:
-                st.write(f"**{res.get('title')}**")
-                st.caption(res.get("snippet", ""))
-                st.markdown(f"[Link]({res.get('link')})")
-        except Exception as e:
-            st.warning(f"SerpAPI failed: {e}")
+            st.warning(f"OpenAI error: {e}")
 
 st.markdown("---")
-st.caption("Tip: For very long YouTube tracks, generate 10–30 min segments and loop/crossfade in your editor. Headphones recommended for binaural effect. All audio is original synthetic content.")
+st.caption("Tip: For full-length YouTube videos, generate multiple segments and loop/crossfade them in your editor. Headphones recommended for binaural effect.")
